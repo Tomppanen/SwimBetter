@@ -6,12 +6,16 @@ import matplotlib
 import subprocess
 from io import BytesIO
 import cred
+import asyncio
+
 matplotlib.use("Agg")
 
 input_folder = cred.path
 all_files = [f for f in os.listdir(input_folder) if f.endswith(".json")]
+output_dir = cred.opath
+os.makedirs(output_dir, exist_ok=True)
 
-for filename in all_files:
+async def process_file(filename):
     filepath = os.path.join(input_folder, filename)
     with open(filepath) as f:
         data = json.load(f)
@@ -37,8 +41,6 @@ for filename in all_files:
     ymin = min(np.min(left_total), np.min(right_total)) * 1.1
     ymax = max(np.max(left_total), np.max(right_total)) * 1.1
 
-    output_dir = cred.opath
-    os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"st_{os.path.splitext(filename)[0]}.mp4")
     
     ffmpeg_cmd = [
@@ -80,4 +82,16 @@ for filename in all_files:
     pipe.wait()
     plt.close(fig)
 
-print(f"Video saved as: {output_file}")
+    print(f"Video saved as: {output_file}")
+
+async def main():
+    semaphore = asyncio.Semaphore(4)
+
+    async def sem_task(filename):
+        async with semaphore:
+            await asyncio.to_thread(process_file, filename)
+
+    await asyncio.gather(*(sem_task(filename) for filename in all_files))
+
+
+asyncio.run(main())
