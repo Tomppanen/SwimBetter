@@ -1,21 +1,14 @@
 import os
 import json
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib
 import subprocess
-from io import BytesIO
+import cv2
 import cred
-import asyncio
-
-matplotlib.use("Agg")
 
 input_folder = cred.path
 all_files = [f for f in os.listdir(input_folder) if f.endswith(".json")]
-output_dir = cred.opath
-os.makedirs(output_dir, exist_ok=True)
 
-async def process_file(filename):
+for filename in all_files:
     filepath = os.path.join(input_folder, filename)
     with open(filepath) as f:
         data = json.load(f)
@@ -35,63 +28,70 @@ async def process_file(filename):
     left_interp = np.interp(frame_times, left_time, left_total)
     right_interp = np.interp(frame_times, right_time, right_total)
 
-    dpi = 200
-    figsize = (10, 5)
-    width, height = int(figsize[0] * dpi), int(figsize[1] * dpi)
-    ymin = min(np.min(left_total), np.min(right_total)) * 1.1
-    ymax = max(np.max(left_total), np.max(right_total)) * 1.1
+    width, height = 1280, 720
+    ymin, ymax = -8, 8
 
+    output_dir = cred.opath
+    os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"st_{os.path.splitext(filename)[0]}.mp4")
-    
+
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "image2pipe",
-        "-vcodec", "png",
-        "-r", str(target_fps),
-        "-i", "-",
-        "-vcodec", "libx264",
-        "-pix_fmt", "yuv420p",
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{width}x{height}',
+        '-r', str(target_fps),
+        '-i', '-',
+        '-an',
+        '-vcodec', 'libx264',
+        '-pix_fmt', 'yuv420p',
         output_file
     ]
     pipe = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-
     for i, t in enumerate(frame_times):
-        ax.clear()
+        img = np.ones((height, width, 3), dtype=np.uint8) * 255
         start_time = max(0, t - window_ms)
-        time_window = frame_times[(frame_times >= start_time) & (frame_times <= t)]
-        left_window = left_interp[(frame_times >= start_time) & (frame_times <= t)]
-        right_window = right_interp[(frame_times >= start_time) & (frame_times <= t)]
+        mask = (frame_times >= start_time) & (frame_times <= t)
+        time_window = frame_times[mask]
+        left_window = left_interp[mask]
+        right_window = right_interp[mask]
 
-        ax.plot(time_window / 1000, left_window, color="blue", label="Left")
-        ax.plot(time_window / 1000, right_window, color="red", label="Right")
-        ax.set_xlim(start_time / 1000, t / 1000)
-        ax.set_ylim(ymin, ymax)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Total Force")
-        ax.set_title("Real-Time Stroke Force")
-        ax.legend(loc="upper right")
+        if len(time_window) < 2:
+            continue
 
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=dpi)
-        pipe.stdin.write(buf.getvalue())
-        buf.close()
+        # Normalize for drawing
+        time_sec = (time_window - time_window[0]) / 1000
+        time_norm = np.interp(time_sec, (0, time_sec[-1]), (100, width - 100))
+        left_norm = np.interp(left_window, (ymin, ymax), (height - 100, 100))
+        right_norm = np.interp(right_window, (ymin, ymax), (height - 100, 100))
+
+        # Draw lines
+        for j in range(1, len(time_norm)):
+            pt1 = (int(time_norm[j - 1]), int(left_norm[j - 1]))
+            pt2 = (int(time_norm[j]), int(left_norm[j]))
+            cv2.line(img, pt1, pt2, (255, 0, 0), 2)
+
+            pt1 = (int(time_norm[j - 1]), int(right_norm[j - 1]))
+            pt2 = (int(time_norm[j]), int(right_norm[j]))
+            cv2.line(img, pt1, pt2, (0, 0, 255), 2)
+
+        # Labels
+        cv2.putText(img, "Left (blue)", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        cv2.putText(img, "Right (red)", (200, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(img, f"Time: {t/1000:.2f}s", (width - 250, height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+        filename_text = os.path.splitext(filename)[0]
+        cv2.putText(img, filename_text, (500, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+        for val in np.linspace(ymin, ymax, 5):
+            y_tick = int(np.interp(val, (ymin, ymax), (height - 100, 100)))
+            cv2.line(img, (90, y_tick), (100, y_tick), (0, 0, 0), 1)
+            cv2.putText(img, f"{val:.1f}", (40, y_tick + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+
+        pipe.stdin.write(img.tobytes())
 
     pipe.stdin.close()
     pipe.wait()
-    plt.close(fig)
-
     print(f"Video saved as: {output_file}")
-
-async def main():
-    semaphore = asyncio.Semaphore(4)
-
-    async def sem_task(filename):
-        async with semaphore:
-            await asyncio.to_thread(process_file, filename)
-
-    await asyncio.gather(*(sem_task(filename) for filename in all_files))
-
-
-asyncio.run(main())
